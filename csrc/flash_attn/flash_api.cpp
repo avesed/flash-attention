@@ -1505,8 +1505,13 @@ mha_fwd_kvcache(Tensor q,                 // batch_size x seqlen_q x num_heads x
         // block_table only has max_num_blocks_per_seq entries per sequence, so if any sequence length
         // exceeds max_num_blocks_per_seq * page_block_size the kernel reads block_table out of bounds.
         // The kernel itself does no such check, so validate the caller contract here.
-        // Reading the maximum forces a device-to-host sync, so only do it for paged KV.
-        if (paged_KV) {
+        // Reading the maximum forces a device-to-host sync, so only do it for paged KV, and never
+        // while the stream is being captured into a CUDA graph: the sync is illegal there and
+        // invalidates the capture. Graph replays rely on the caller's block_table sizing.
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        STD_TORCH_CHECK(cudaStreamIsCapturing(get_current_cuda_stream(q), &capture_status) == cudaSuccess,
+                        "cudaStreamIsCapturing failed");
+        if (paged_KV && capture_status == cudaStreamCaptureStatusNone) {
             const int seqlen_knew = k_.has_value() ? k.size(1) : 0;
             const auto max_seqlen_k_tensor = torch::stable::amax(seqlens_k, 0);
             int32_t max_seqlen_k_value;
