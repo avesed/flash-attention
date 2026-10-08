@@ -45,6 +45,10 @@ namespace FLASH_NAMESPACE {
 using torch::stable::Tensor;
 using torch::headeronly::ScalarType;
 
+// Defined in flash_fwd_paged_kv_bounds_check.cu.
+void run_paged_kv_seqlens_bound_check(const int *seqlens_k, int batch_size, int seqlen_knew, int capacity,
+                                      cudaStream_t stream);
+
 // Stable-ABI replacement for at::cuda::getCurrentCUDAStream().stream().
 static inline cudaStream_t get_current_cuda_stream(const Tensor &t) {
     void *stream_ptr = nullptr;
@@ -1505,23 +1509,14 @@ mha_fwd_kvcache(Tensor q,                 // batch_size x seqlen_q x num_heads x
         // block_table only has max_num_blocks_per_seq entries per sequence, so if any sequence length
         // exceeds max_num_blocks_per_seq * page_block_size the kernel reads block_table out of bounds.
         // The kernel itself does no such check, so validate the caller contract here.
-        // Reading the maximum forces a device-to-host sync, so only do it for paged KV, and never
-        // while the stream is being captured into a CUDA graph: the sync is illegal there and
-        // invalidates the capture. Graph replays rely on the caller's block_table sizing.
-        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-        STD_TORCH_CHECK(cudaStreamIsCapturing(get_current_cuda_stream(q), &capture_status) == cudaSuccess,
-                        "cudaStreamIsCapturing failed");
-        if (paged_KV && capture_status == cudaStreamCaptureStatusNone) {
+        // Checked on the device, queued ahead of the attention kernel on the same stream: reading the
+        // maximum on the host needs a device-to-host sync, which is illegal under CUDA graph capture and
+        // stalls every eager call (e.g. a PIECEWISE spec-decode drafter, once per decode step).
+        if (paged_KV) {
             const int seqlen_knew = k_.has_value() ? k.size(1) : 0;
-            const auto max_seqlen_k_tensor = torch::stable::amax(seqlens_k, 0);
-            int32_t max_seqlen_k_value;
-            TORCH_ERROR_CODE_CHECK(aoti_torch_item_int32(max_seqlen_k_tensor.get(), &max_seqlen_k_value));
-            const int max_seqlen_k = max_seqlen_k_value + seqlen_knew;
-            STD_TORCH_CHECK(max_seqlen_k <= max_num_blocks_per_seq * page_block_size,
-                            "Paged KV cache: max(seqlens_k)", seqlen_knew > 0 ? " + seqlen_knew" : "", " (= ", max_seqlen_k,
-                            ") exceeds the capacity addressable by block_table (max_num_blocks_per_seq * page_block_size = ",
-                            max_num_blocks_per_seq * page_block_size, "). Allocate more columns in block_table, otherwise the "
-                            "kernel would index block_table out of bounds.");
+            run_paged_kv_seqlens_bound_check(static_cast<const int *>(seqlens_k.data_ptr()), batch_size,
+                                             seqlen_knew, max_num_blocks_per_seq * page_block_size,
+                                             get_current_cuda_stream(q));
         }
         params.cu_seqlens_k = static_cast<int *>(seqlens_k.data_ptr());
     }

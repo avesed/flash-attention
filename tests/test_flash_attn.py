@@ -1,4 +1,5 @@
 import math
+import time
 
 import pytest
 import torch
@@ -2635,7 +2636,9 @@ def test_flash_attn_kvcache_paged_block_table_bounds(append_knew, paged_kv_block
     # block_table only has `max_num_blocks_per_seq` columns, so the split-KV kernel can
     # only safely index it up to max_num_blocks_per_seq * page_block_size tokens. If any
     # cache_seqlens[b] (+ appended new keys) exceeds that capacity, mha_fwd_kvcache must
-    # raise instead of letting the kernel read block_table out of bounds.
+    # fail instead of letting the kernel read block_table out of bounds. The guard is a
+    # device-side assert (no device-to-host sync), which poisons the CUDA context, so the
+    # violating call runs in a subprocess.
     device = "cuda"
     batch_size = 1
     nheads = 1
@@ -2664,17 +2667,32 @@ def test_flash_attn_kvcache_paged_block_table_bounds(append_knew, paged_kv_block
         v_new = None
         cache_seqlens = torch.full((batch_size,), capacity + 1, dtype=torch.int32, device=device)
 
-    with pytest.raises(RuntimeError, match="block_table"):
-        flash_attn_with_kvcache(
-            q,
-            k_cache_paged,
-            v_cache_paged,
-            k=k_new,
-            v=v_new,
-            cache_seqlens=cache_seqlens,
-            block_table=block_table,
-            causal=False,
-        )
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(f"""
+        import torch
+        from flash_attn import flash_attn_with_kvcache
+        torch.manual_seed(0)
+        dev, dt = "cuda", torch.{str(dtype).split(".")[-1]}
+        k_cache = torch.randn({num_blocks}, {paged_kv_block_size}, {nheads}, {d}, device=dev, dtype=dt)
+        v_cache = torch.randn_like(k_cache)
+        block_table = torch.zeros({batch_size}, {max_num_blocks_per_seq}, dtype=torch.int32, device=dev)
+        q = torch.randn({batch_size}, 1, {nheads}, {d}, device=dev, dtype=dt)
+        knew = {seqlen_knew}
+        k_new = torch.randn({batch_size}, knew, {nheads}, {d}, device=dev, dtype=dt) if knew else None
+        v_new = torch.randn_like(k_new) if knew else None
+        seqlens = torch.full(({batch_size},), {int(cache_seqlens[0])}, dtype=torch.int32, device=dev)
+        flash_attn_with_kvcache(q, k_cache, v_cache, k=k_new, v=v_new, cache_seqlens=seqlens,
+                                block_table=block_table, causal=False)
+        torch.cuda.synchronize()
+        print("NO_ERROR")
+    """)
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=300)
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0 and "NO_ERROR" not in output, output
+    assert "device-side assert" in output or "block_table" in output, output
 
     # Positive control: exactly at capacity (and no appended keys) must NOT raise.
     cache_seqlens_ok = torch.full((batch_size,), capacity, dtype=torch.int32, device=device)
@@ -2688,6 +2706,23 @@ def test_flash_attn_kvcache_paged_block_table_bounds(append_knew, paged_kv_block
     )
     assert out.shape == (batch_size, 1, nheads, d)
     assert not out.isnan().any()
+
+    # The guard must not block the host: queue a long GPU sleep, then the call must return
+    # well before the sleep ends.
+    torch.cuda.synchronize()
+    torch.cuda._sleep(int(2e9))
+    t0 = time.perf_counter()
+    flash_attn_with_kvcache(
+        q,
+        k_cache_paged,
+        v_cache_paged,
+        cache_seqlens=cache_seqlens_ok,
+        block_table=block_table,
+        causal=False,
+    )
+    host_s = time.perf_counter() - t0
+    torch.cuda.synchronize()
+    assert host_s < 0.1, f"mha_fwd_kvcache blocked the host for {host_s:.3f}s (device-to-host sync)"
 
 
 @pytest.mark.skipif(USE_TRITON_ROCM, reason="compat-slot assert is only in the CUDA extension")
